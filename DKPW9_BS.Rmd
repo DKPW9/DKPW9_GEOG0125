@@ -1,0 +1,563 @@
+---
+title: "DKPW9_BS"
+output: html_document
+date: "2024-03-28"
+---
+
+# Spatial analysis of teenage pregnancies, Alabama, USA
+This RMarkdown contains the code pertaining to GEOG0125 assessment part 1 (Bayesian spatial modelling).
+
+## Loading packages
+```{r Loading relevant packages}
+library(sf)
+library(dplyr)
+library(janitor)
+library(stringr)
+library(tidyr)
+library(tools)
+library(ggplot2)
+```
+
+## Loading data
+In this analysis I have 5 datasets to load in. These are:
+1. Teenage pregnancies (dependent variable)
+2. Population (exposure variable)
+3. Poverty (independent variable)
+4. Educational attainment (independent variable)
+5. Health insurance access (independent variable)
+6. Alabama county shapefile
+
+```{r Loading in data}
+pregnancy <- read.csv('pregnancy.csv')
+population <- read.csv('population.csv', skip = 1)
+poverty <- read.csv('poverty.csv')
+education <- read.csv('education.csv')
+insurance <- read.csv('insurance.csv')
+counties <- st_read('alabama_shapefile')
+```
+
+## Data cleaning
+I need to do some data cleaning as well as transformations. I will start with the pregnancy data. Currently, the data is stored as rates of pregnancies in girls aged 15-19 per 1,000. To obtain counts (required for the Bayesian model), I need to convert the rate using the population data before creating a new column that contains count data.
+
+```{r Data cleaning 1: Teenage pregnancies}
+# Tidying the names
+pregnancy <- clean_names(pregnancy)
+population <- clean_names(population)
+
+# Removing unnecessary columns
+pregnancy <- pregnancy %>%
+  select(-state_fips_code, -county_fips_code, -combined_fips_code, -lower_confidence_limit, -upper_confidence_limit)
+
+population <- population %>%
+  select(-starts_with("margin_"))
+
+# Removing the additional words in the county column name so it's compatible with the pregnancy dataset
+population$geographic_area_name <- str_replace_all(population$geographic_area_name, "County, Alabama", "")
+
+# Dropping rows unrelated to Alabama
+pregnancy <- pregnancy[-seq(1207, 56466), ]
+population <- population[-seq(68, 3221), ]
+
+# Dropping rows so that only 2020 data remains
+pregnancy <- pregnancy %>%
+  filter(year == 2020)
+
+# Dropping the state and year columns now that they're not needed anymore
+pregnancy <- pregnancy %>%
+  select(-state, -year)
+
+# Extracting the total female population aged 15-19 column from the wider population dataset and turning it into its own separate data frame for ease (population dataset is huge)
+female_population_15_19 <- population %>%
+  select(geographic_area_name, estimate_female_total_population_age_15_to_19_years)
+
+# Renaming the columns for compatability
+female_population_15_19 <- female_population_15_19 %>%
+  rename(`total_female_pop` = estimate_female_total_population_age_15_to_19_years, `county` = geographic_area_name)
+
+# Dealing with the space after the county name
+female_population_15_19$county <- trimws(female_population_15_19$county)
+
+# Joining the datasets together
+pregnancy <- left_join(female_population_15_19, pregnancy, by = "county")
+
+# Creating a column that contains a count of births by girls aged 15-19
+pregnancy$births_count <- (pregnancy$birth_rate * pregnancy$total_female_pop) / 1000
+
+# I also want to create a dataframe that contains the population of each county so that I can use this to calculate rates 
+population_V2 <- subset(population, select = c("geographic_area_name", 
+                                            "estimate_total_total_population",
+                                            "estimate_total_total_population_selected_age_categories_18_years_and_over"))
+
+# Renaming columns for clarity
+population_V2 <- population_V2 %>%
+  rename(`county` = geographic_area_name, `total_pop` = estimate_total_total_population, `over_18_pop` = estimate_total_total_population_selected_age_categories_18_years_and_over)
+
+# Removing the space after county names
+population_V2$county <- tolower(trimws(population_V2$county))
+population_V2$county <- sapply(population_V2$county, toTitleCase)
+```
+
+Now that my dependent variable is tidied and ready, I will prepare my independent variables, starting with poverty. What I want is the rate of households existing below the poverty line per county (ie. households /1000 that are below the poverty line).
+
+```{r Data cleaning 2: Poverty}
+# Tidying the names
+poverty <- clean_names(poverty)
+
+# Dropping unnecessary rows
+poverty <- poverty[-seq(12, 68), ]
+
+poverty <- poverty %>%
+  slice(c(3, 7, 11))
+
+# Filtering dataset to keep only the columns containing the poverty estimate as count data
+poverty <- poverty %>%
+  select(label_grouping, ends_with("alabama_below_poverty_level_estimate"))
+
+# Pivoting the dataframe from wide to long format
+poverty_long <- pivot_longer(
+  data = poverty,
+  cols = ends_with("_estimate"), 
+  names_to = "county",
+  values_to = "value",
+  names_pattern = "(.*)_alabama_below_poverty_level_estimate"
+)
+
+poverty <- poverty_long %>%
+  pivot_wider(
+    names_from = label_grouping, 
+    values_from = value
+  )
+
+# Tidying the names
+poverty <- clean_names(poverty)
+
+# Removing commas and getting R to read the data as numeric
+poverty$under_18_years <- as.numeric(gsub(",", "", poverty$under_18_years))
+
+poverty$x18_to_64_years <- as.numeric(gsub(",", "", poverty$x18_to_64_years))
+
+poverty$x65_years_and_over <- as.numeric(gsub(",", "", poverty$x65_years_and_over))
+
+# Creating a new column that contains the total number of individuals in poverty per county
+poverty$poverty_count <- rowSums(poverty[, sapply(poverty, is.numeric)], na.rm = TRUE)
+
+# Removing unnecessary columns
+poverty <- poverty %>%
+  select(-under_18_years, -x18_to_64_years, -x65_years_and_over)
+
+# Fixing the way that county names are written for compatability with other datasets
+poverty$county <- gsub("_county", "", poverty$county)
+poverty$county <- gsub("_", " ", poverty$county)
+poverty$county <- sapply(poverty$county, toTitleCase)
+
+# Merging poverty with the population_V2 dataset so I can calculate rates rather than work with raw counts
+poverty_V2 <- merge(poverty, population_V2, by = "county")
+
+# Calculate the poverty rate per 1,000 individuals
+poverty_V2$poverty_rate <- (poverty_V2$poverty_count / poverty_V2$total_pop) * 1000
+
+# Removing unnecessary columns
+poverty_V2 <- poverty_V2 %>% 
+  select(1, 5)
+```
+
+A rate of households under the poverty line for each county is now ready. Next I will clean my health insurance dataset. What I want is a rate of the total number of people without health insurance in each county in Alabama (ie. individuals with no health insurance /1000).
+
+```{r Data cleaning 3: Health insurance}
+# Tidying the names
+insurance <- clean_names(insurance)
+
+# Filtering dataset to keep only the columns containing the no insurance estimate as count data
+insurance <- insurance %>%
+  select(label_grouping, ends_with("alabama_estimate"))
+
+# Filtering the dataset to keep only the rows pertaining to no insurance data
+insurance <- insurance %>%
+  filter(str_detect(label_grouping, "^No"))
+
+# Remove commas from all columns that end with "_estimate" and convert them to numeric
+insurance <- insurance %>%
+  mutate(across(ends_with("_estimate"), ~as.numeric(gsub(",", "", .))))
+
+# Totalling all the no insurance numbers currently stored in separate rows and creating a list with this 
+subset_insurance <- insurance[1:18,]
+row_sums <- colSums(subset_insurance[, sapply(subset_insurance, is.numeric)], na.rm = TRUE)
+new_row <- c("no_insurance_count", row_sums)
+insurance[nrow(insurance) + 1,] <- new_row
+
+# Now creating a data frame that is in the correct format (matches the poverty one from above)
+# Credit to ChatGPT for helping me write this
+county_names <- names(insurance)[-1]  
+county_names <- gsub("_estimate", "", county_names)
+insurance <- data.frame(
+  county = county_names,
+  no_insurance_count = new_row[-1]  
+)
+
+insurance$no_insurance_count <- as.numeric(new_row_df$no_insurance_count)
+
+rownames(insurance) <- NULL
+
+# Fixing the way that county names are written for compatability with other datasets
+insurance$county <- gsub("_county_alabama", "", insurance$county)
+insurance$county <- gsub("_", " ", insurance$county)
+insurance$county <- sapply(insurance$county, toTitleCase)
+insurance$county <- gsub(" alabama", "", insurance$county, ignore.case = TRUE)
+
+# Merging insurance with the population_V2 dataset so I can calculate rates rather than work with raw counts
+insurance_V2 <- merge(insurance, population_V2, by = "county")
+
+# Calculate the no insurance rate per 1,000 individuals
+insurance_V2$no_insurance_rate <- (insurance_V2$no_insurance_count / insurance_V2$total_pop) * 1000
+
+# Removing unnecessary columns
+insurance_V2 <- insurance_V2 %>% 
+  select(1, 5)
+```
+
+A rate of households without health insurance for each county is now ready. Next I will clean my educational attainment dataset. What I want is a rate of the total number of people less than a high school diploma (ie. individuals with no high school diploma /1000).
+
+```{r Data cleaning 4: Educational attainment}
+# Tidying the names
+education <- clean_names(education)
+
+# Keeping only the relevant rows
+education <- education[1:4, ]
+
+# Filtering dataset to keep only the columns containing the total estimates
+education <- education %>%
+  select(label_grouping, ends_with("alabama_total_estimate"))
+
+# Dropping unnecessary rows
+education <- education[-seq(1, 3), ]
+
+# Totalling all the no education numbers currently stored in separate rows and creating a list with this
+education <- education %>%
+  mutate(across(ends_with("total_estimate"), ~as.numeric(gsub(",", "", .))))
+row_sums_education <- colSums(education[, sapply(education, is.numeric)], na.rm = TRUE)
+
+# Now creating a data frame that is in the correct format (matches the insurance one from above)
+# Credit to ChatGPT for helping me write this
+county_names2 <- names(education)[-1]  
+county_names2 <- gsub("_total_estimate$", "", county_names2)
+county_names2 <- gsub("_county_alabama$", "", county_names2)
+county_names2 <- str_replace_all(county_names2, "_", " ")
+county_names2 <- tools::toTitleCase(county_names2)
+
+education <- data.frame(
+  county = county_names2,
+  no_education_count = as.numeric(row_sums_education)
+)
+
+# Merging education with the population_V2 dataset so I can calculate rates rather than work with raw counts
+education_V2 <- merge(education, population_V2, by = "county")
+
+# Calculate the no diploma rate per 1,000 individuals
+education_V2$no_education_rate <- (education_V2$no_education_count / education_V2$over_18_pop) * 1000
+
+# Removing unnecessary columns
+education_V2 <- education_V2 %>% 
+  select(1, 5)
+```
+
+Now all of my independent variables are cleaned, I will just at last attend to my shapefile.
+
+```{r Data cleaning 5: Shapefile}
+# Removing unnecessary columns
+counties <- counties %>%
+  select(-id, -STATE, -TYPE, -CNTRY)
+
+# Renaming columns for compatability
+counties <- counties %>%
+  rename(`county` = name)
+
+# Checking to see whether there are any differences in the ways that counties are spelled in the 'county' column 
+identical(counties$county, insurance$county)
+
+# Identifying unique counties (using the insurance dataset)
+unique_to_counties <- setdiff(counties$county, insurance$county)
+print(unique_to_counties)
+
+unique_to_insurance <- setdiff(insurance$county, counties$county)
+print(unique_to_insurance)
+
+# Editing the names of St Clair and De Kalb for compatability
+counties <- counties %>%
+  mutate(county = ifelse(county == "Saint Clair", "St Clair", county))
+
+counties <- counties %>%
+  mutate(county = ifelse(county == "DeKalb", "De Kalb", county))
+
+# Joining all my dataframes together before assigning the geometry
+pregnancy <- left_join(pregnancy, insurance_V2, by = "county")
+pregnancy <- left_join(pregnancy, poverty_V2, by = "county")
+pregnancy <- left_join(pregnancy, education_V2, by = "county")
+
+# Assigning the geometries
+pregnancy <- left_join(pregnancy, counties, by = "county")
+pregnancy <- st_as_sf(pregnancy, sf_column_name = "geometry")
+
+# Finally just dropping the birth_rate column as this shan't be used in modelling 
+pregnancy <- pregnancy %>%
+  select(-birth_rate)
+
+# Finally, converting all columns to integers as this is required for the Stan script to work
+pregnancy$births_count <- as.integer(pregnancy$births_count)
+pregnancy$no_insurance_rate <- as.integer(pregnancy$no_insurance_rate)
+pregnancy$poverty_rate <- as.integer(pregnancy$poverty_rate)
+pregnancy$no_education_rate <- as.integer(pregnancy$no_education_rate)
+```
+
+Now my shapefile is joined to my whole dataset, I am ready to move on.
+
+## Exploratory data analysis
+
+Firstly, I want to look at the frequency distribution of my outcome variable (pregnancy) using a histogram so I can see which Poisson model it suits best. 
+
+```{r EDA 1: Outcome variable distribution}
+hist(pregnancy$births_count, breaks=20)
+```
+
+Since the implementation of these models is highly dependent on how the frequency distribution of the count response variable is displayed, this is a crucial step. From the graph above I can see that there's evidence of over-disperson, meaning that I should use the Negative Binomial Poisson Regression.
+
+I will now move onto the modelling stages.
+
+## Data preparation
+
+Before I start modelling I want to load all of the necessary packages.
+
+```{r Loading necessary packages}
+library("tmap")
+library("spdep")
+library("rstan")
+library("geostan")
+library("SpatialEpi")
+library("tidybayes")
+library("tidyverse")
+```
+
+I also want to configure the rstan package with R using the following code.
+
+```{r Configuring rstan}
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+```
+
+To estimate the probability of teenage pregnancies at a county level in Alabama, I need to first create a column that contains estimates from expected number of pregnancies. This is derived from the total population (of women per county) column, which is multiplied to the overall incidence rates of teenage pregnancies to get the number of expected pregnancies for each county.
+
+```{r Calculating expected numbers}
+# Calculate the expected number of teenage pregnancies
+pregnancy$ExpectedNum <- round(expected(population = pregnancy$total_female_pop, cases = pregnancy$births_count, n.strata = 1), 0)
+```
+
+Now that I've got my ExpectedNum column it can be used as an offset in the spatial model.
+
+Next I need to transform my area into a list of nodes and edges as Stan can only identify adjacency with a set of paired nodes with edges that connect them. The following code will do this.
+
+```{r Converting the spatial adjacency matrix to nodes and edges}
+# Coercing my sf object into a spatial object (sp)
+sp_pregnancy <- as(pregnancy, "Spatial")
+
+# Coercing my sp object into a matrix object
+adjacencyMatrix <- shape2mat(sp_pregnancy)
+
+# Extracting components for the ICAR model
+extractComponents <- prep_icar_data(adjacencyMatrix)
+
+# Information needed is stored in the following objects:
+n <- as.numeric(extractComponents$group_size)
+nod1 <- extractComponents$node1
+nod2 <- extractComponents$node2
+n_edges <- as.numeric(extractComponents$n_edges)
+```
+
+Now I need to create the dataset to be compiled in Stan. This involves defining the variables and extracting them into separate vectors.
+
+```{r Creating the dataset for Stan}
+# Extracting my variables
+y <- pregnancy$births_count
+x1 <- pregnancy$no_insurance_rate
+x2 <- pregnancy$poverty_rate
+x3 <- pregnancy$no_education_rate
+e <- pregnancy$ExpectedNum
+
+# Putting all the components into a list object
+stan.spatial.dataset <- list(
+  N = n,
+  N_edges = n_edges,
+  node1 = nod1,
+  node2 = nod2,
+  Y = y,
+  X = cbind(x1, x2, x3),
+  Offset = e
+)
+```
+
+Everything in the list object will be passed to Stan in the data block. Therefore, the data preparation stage is done and I can move onto developing the ICAR model in a separate Stan script.
+
+## Modelling
+
+Now that the Stan script was prepared (/BS.stan), I can use the stan to compile the saved script to obtain the posterior estimation of the parameters of the model.
+
+```{r Modelling 1: Obtaining the posterior estimation}
+icar_poisson_fit = stan("BS.stan", data=stan.spatial.dataset, iter=20000, control = list(max_treedepth = 12), chains=6, verbose = FALSE)
+```
+Next I want to see my estimated alpha/beta/sigma results.
+
+```{r Modelling 2: Obtaining estimated results}
+options(scipen = 999)
+summary(icar_poisson_fit, pars=c("alpha", "beta", "sigma"), probs=c(0.025, 0.975))$summary
+```
+I can also view the spatial effects for each area with the following code:
+
+```{r Modelling 3: Viewing the area-level spatial effects}
+print(icar_poisson_fit, pars=c("alpha", "beta", "sigma"), probs=c(0.025, 0.975))
+```
+
+Before mapping RR, it's essential to check that none of the estimates exceed the rHAT value of 1.1 as this indicates that iterations didn't perform well if above this value. A rapid check for this, identifying any parameters that aren't valid can be done by creating a binary variable of 1s (valid) and 0s (not valid).
+
+```{r Modelling 4: Rapid diagnostics of the rHATs}
+# Diagnostic check on the rHats
+diagnostic.checks <- as.data.frame(summary(icar_poisson_fit, pars=c("alpha", "beta", "sigma", "lp__"), probs=c(0.025, 0.5, 0.975))$summary)
+
+# Creating a binary variable + tabulating it
+diagnostic.checks$valid <- ifelse(diagnostic.checks$Rhat < 1.1, 1, 0)
+table(diagnostic.checks$valid)
+```
+
+I can move on to generate maps.
+
+## Generating maps
+
+Firstly, I want to extract + map the area-specific RRs.
+
+```{r Generating maps 1: Area-specific RRs}
+head(summary(icar_poisson_fit, pars=c("rr_mu"), probs=c(0.025, 0.975))$summary)
+
+# Extracting key posterior results for the generated quantities 
+relativeRisk.results <- as.data.frame(summary(icar_poisson_fit, pars=c("rr_mu"), probs=c(0.025, 0.975))$summary)
+
+# Inserting clean row numbers to a new data frame
+row.names(relativeRisk.results) <- 1:nrow(relativeRisk.results)
+
+# Rearranging the columns into order
+relativeRisk.results <- relativeRisk.results[, c(1,4,5,7)]
+
+# Renaming columns for clarity
+colnames(relativeRisk.results)[1] <- "rr"
+colnames(relativeRisk.results)[2] <- "rrlower"
+colnames(relativeRisk.results)[3] <- "rrupper"
+colnames(relativeRisk.results)[4] <- "rHAT"
+
+# Viewing the cleaned table 
+head(relativeRisk.results)
+
+# Generating risk maps by aligning results to areas in shapefile
+pregnancy$rr <- relativeRisk.results[, "rr"]
+pregnancy$rrlower <- relativeRisk.results[, "rrlower"]
+pregnancy$rrupper <- relativeRisk.results[, "rrupper"]
+
+# Creating categories to define if an area has significant increase or decrease in risk, or nothing all 
+pregnancy$Significance <- NA
+pregnancy$Significance[pregnancy$rrlower<1 & pregnancy$rrupper>1] <- 0    # NOT SIGNIFICANT
+pregnancy$Significance[pregnancy$rrlower==1 | pregnancy$rrupper==1] <- 0  # NOT SIGNIFICANT
+pregnancy$Significance[pregnancy$rrlower>1 & pregnancy$rrupper>1] <- 1    # SIGNIFICANT INCREASE
+pregnancy$Significance[pregnancy$rrlower<1 & pregnancy$rrupper<1] <- -1   # SIGNIFICANT DECREASE
+
+# For map design for the relative risk -- you want to understand or get a handle on what the distribution for risks look like
+summary(pregnancy$rr)
+hist(pregnancy$rr)
+
+# Creating the labels
+RiskCategorylist <- c(">0.0 to 0.25", "0.26 to 0.50", "0.51 to 0.75", "0.76 to 0.99", "1.00 & <1.01",
+    "1.01 to 1.10", "1.11 to 1.25", "1.26 to 1.50", "1.51 to 1.75", "1.76 to 2.00", "2.01 to 3.00")
+
+# Creating the discrete colour changes for my legends and want to use a divergent colour scheme
+RRPalette <- c("#65bafe","#98cffe","#cbe6fe","#dfeffe","white","#fed5d5","#fcbba1","#fc9272","#fb6a4a","#de2d26","#a50f15")
+
+# Categorising the risk values to match the labelling in RiskCategorylist object
+pregnancy$RelativeRiskCat <- NA
+pregnancy$RelativeRiskCat[pregnancy$rr>= 0 & pregnancy$rr <= 0.25] <- -4
+pregnancy$RelativeRiskCat[pregnancy$rr> 0.25 & pregnancy$rr <= 0.50] <- -3
+pregnancy$RelativeRiskCat[pregnancy$rr> 0.50 & pregnancy$rr <= 0.75] <- -2
+pregnancy$RelativeRiskCat[pregnancy$rr> 0.75 & pregnancy$rr < 1] <- -1
+pregnancy$RelativeRiskCat[pregnancy$rr>= 1.00 & pregnancy$rr < 1.01] <- 0
+pregnancy$RelativeRiskCat[pregnancy$rr>= 1.01 & pregnancy$rr <= 1.10] <- 1
+pregnancy$RelativeRiskCat[pregnancy$rr> 1.10 & pregnancy$rr <= 1.25] <- 2
+pregnancy$RelativeRiskCat[pregnancy$rr> 1.25 & pregnancy$rr <= 1.50] <- 3
+pregnancy$RelativeRiskCat[pregnancy$rr> 1.50 & pregnancy$rr <= 1.75] <- 4
+pregnancy$RelativeRiskCat[pregnancy$rr> 1.75 & pregnancy$rr <= 2.00] <- 5
+pregnancy$RelativeRiskCat[pregnancy$rr> 2.00 & pregnancy$rr <= 10] <- 6
+
+# Checking that the legend scheme is balanced
+table(pregnancy$RelativeRiskCat)
+
+# Generating the maps of relative risk and of significance regions
+# Map 1: Relative risk
+rr_map <- tm_shape(pregnancy) + 
+    tm_fill("RelativeRiskCat", style = "cat", title = "Relative Risk", palette = RRPalette, labels = RiskCategorylist) +
+    tm_shape(counties) + tm_polygons(alpha = 0.05) +
+    tm_layout(frame = FALSE, legend.outside = TRUE, legend.title.size = 1, legend.text.size = 0.7) +
+    tm_scale_bar(position = c("right", "bottom"))
+
+# Map 2: Significance regions
+sg_map <- tm_shape(pregnancy) + 
+    tm_fill("Significance", style = "cat", title = "Significance Categories", 
+        palette = c("#33a6fe", "white", "#fe0000"), labels = c("Significantly low", "Not Significant", "Significantly high")) +
+    tm_shape(counties) + tm_polygons(alpha = 0.10) +
+    tm_layout(frame = FALSE, legend.outside = TRUE, legend.title.size = 1, legend.text.size = 0.7) +
+    tm_scale_bar(position = c("right", "bottom"))
+
+# Creating a side-by-side plot
+tmap_arrange(rr_map, sg_map, ncol = 2, nrow = 1)
+
+# Downloading the images 
+tmap_save(rr_map, "/Users/hannah/Desktop/Bayesian/DKPW9_BS/rr_map_image.png", width = 1920, height = 1080, dpi = 300)
+tmap_save(sg_map, "/Users/hannah/Desktop/Bayesian/DKPW9_BS/sg_map_image.png", width = 1920, height = 1080, dpi = 300)
+```
+
+The outputs above show me relative risk as well as significance categories for my study area.
+
+Next I want to extract + map the exceedance probabilities. These allow me to quantify the levels of uncertainty surrounding the risks that were quantified. A threshold such as RR > 1 can be used. This information must be extracted into a vector and included in the pregnancy df.
+
+```{r Generating maps 2: Exceedance probabilities }
+# Computing the probability that an area has a relative risk ratio > 1.0
+threshold <- function(x){mean(x > 1.00)}
+excProbrr <- icar_poisson_fit %>% spread_draws(rr_mu[i]) %>% 
+    group_by(i) %>% summarise(rr_mu=threshold(rr_mu)) %>%
+    pull(rr_mu)
+
+# Inserting the exceedance values into the spatial data frame
+pregnancy$excProb <- excProbrr
+
+# Creating the labels for the probabilities
+ProbCategorylist <- c("<0.01", "0.01-0.09", "0.10-0.19", "0.20-0.29", "0.30-0.39", "0.40-0.49","0.50-0.59", "0.60-0.69", "0.70-0.79", "0.80-0.89", "0.90-0.99", "1.00")
+
+# Categorising the probabilities in bands of 10s
+pregnancy$ProbCat <- NA
+pregnancy$ProbCat[pregnancy$excProb>=0 & pregnancy$excProb< 0.01] <- 1
+pregnancy$ProbCat[pregnancy$excProb>=0.01 & pregnancy$excProb< 0.10] <- 2
+pregnancy$ProbCat[pregnancy$excProb>=0.10 & pregnancy$excProb< 0.20] <- 3
+pregnancy$ProbCat[pregnancy$excProb>=0.20 & pregnancy$excProb< 0.30] <- 4
+pregnancy$ProbCat[pregnancy$excProb>=0.30 & pregnancy$excProb< 0.40] <- 5
+pregnancy$ProbCat[pregnancy$excProb>=0.40 & pregnancy$excProb< 0.50] <- 6
+pregnancy$ProbCat[pregnancy$excProb>=0.50 & pregnancy$excProb< 0.60] <- 7
+pregnancy$ProbCat[pregnancy$excProb>=0.60 & pregnancy$excProb< 0.70] <- 8
+pregnancy$ProbCat[pregnancy$excProb>=0.70 & pregnancy$excProb< 0.80] <- 9
+pregnancy$ProbCat[pregnancy$excProb>=0.80 & pregnancy$excProb< 0.90] <- 10
+pregnancy$ProbCat[pregnancy$excProb>=0.90 & pregnancy$excProb< 1.00] <- 11
+pregnancy$ProbCat[pregnancy$excProb == 1.00] <- 12
+
+# Checking that the legend scheme is balanced 
+table(pregnancy$ProbCat)
+
+# Generating the map
+ep_map <- tm_shape(pregnancy) + 
+    tm_fill("ProbCat", style = "cat", title = "Probability", palette = "PuRd", labels = ProbCategorylist) +
+    tm_shape(counties) + tm_polygons(alpha = 0.05, border.col = "black") + 
+    tm_layout(frame = FALSE, legend.outside = TRUE, legend.title.size = 1, legend.text.size = 0.7) +
+    tm_scale_bar(position = c("right", "bottom"))
+
+# Downloading the image
+tmap_save(ep_map, "/Users/hannah/Desktop/Bayesian/DKPW9_BS/ep_map_image.png", width = 1920, height = 1080, dpi = 300)
+```
