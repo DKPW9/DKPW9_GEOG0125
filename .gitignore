@@ -1,0 +1,10 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+/education.csv
+/insurance.csv
+/population.csv
+/poverty.csv
+/pregnancy.csv
+/alabama_shapefile
