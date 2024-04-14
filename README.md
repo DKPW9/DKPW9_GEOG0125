@@ -1,5 +1,6 @@
-This repository contains the code for my GEOG0125 Part 1: Spatial Bayesian Modelling assessment. 
+This repository contains the code for my GEOG0125 Part 1: Spatial Bayesian Modelling assessment and Part 2: Machine Learning. 
 
+Part 1 note:
 Relevant .csv files were too large to commit to Git so have been ignored via the .gitignore file. If there is any problem accessing the datasets, they can be manually downloaded via these links:
 
 1. Teenage pregnancies: https://www.cdc.gov/nchs/data-visualization/county-teen-births/index.htm
