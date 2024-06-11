@@ -1,5 +1,9 @@
 This repository contains the code for my GEOG0125 Part 1: Spatial Bayesian Modelling assessment and Part 2: Machine Learning. 
 
+Part 1 (Spatial Bayesian Modelling) titled 'A spatial analysis of teenage pregnancies in Alabama, USA', awarded mark of 82.
+
+Part 2 (Machine Learning) titled 'Identifying architectural styles from Google Street View imagery using machine learning: a pilot study in Glasgow, Scotland', awarded mark of 85. 
+
 Part 1 note:
 Relevant .csv files were too large to commit to Git so have been ignored via the .gitignore file. If there is any problem accessing the datasets, they can be manually downloaded via these links:
 
